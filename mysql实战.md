@@ -40,7 +40,9 @@
 insert into t(id,k) values(id1,k1),(id2,k2)
 ```
 这里，我们假设当前 k 索引树的状态，查找到位置后，k1所在的数据页在内存(InnoDB buffer pool) 中，k2所在的数据页不在内存中
+
 ![带changebuffer的更新过程](./pic/带changebuffer的更新过程.png)
+
 这条更新语句做了如下的操作:
 1. Page 1 在内存中，直接更新内存；
 2. Page 2 没有在内存中，就在内存的change buffer区域，记录下“我要往 Page 2 插入一行”这个信息
@@ -53,7 +55,9 @@ insert into t(id,k) values(id1,k1),(id2,k2)
 select * from t where k in (k1, k2)
 ```
 如果读语句发生在更新语句后不久，内存中的数据都还在，那么此时的这两个读操作就与系统表空间（ibdata1）和 redo log（ib_log_fileX）无关了
+
 ![带changebuffer的读过程](./pic/带changebuffer的读过程.png)
+
 从图中可以看到：
 1. 读 Page 1 的时候，直接从内存返回
 2. 要读 Page 2 的时候，需要把 Page 2 从磁盘读入内存中，然后应用change buffer里面的操作日志，生成一个正确的版本并返回结果
@@ -71,3 +75,9 @@ select * from t where k in (k1, k2)
 3. 写redo log。这个redo log包含了数据的变更和change buffer的变更。到这里merge过程就结束了。这时候，数据页和内存中change buffer对应的磁盘位置都还没有修改，属于脏页，之后各自刷回自己的物理数据，就是另外一个过程了。
 
 ## MySQL为什么有时候会选错索引？
+### 优化器的逻辑
+优化器选择索引的目的，是找到一个最优的执行方案，并用最小的代价去执行语句
+- 在数据库里面，扫描行数是影响执行代价的因素之一。扫描的行数越少，意味着访问磁盘数据的次数越少，消耗的 CPU 资源越少。
+- 扫描行数并不是唯一的判断标准，优化器还会结合是否使用临时表、是否排序等因素进行综合判断
+
+**扫描行数是怎么判断的？**
