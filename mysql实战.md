@@ -607,7 +607,7 @@ session A 在遍历的时候，先访问第一个 c=10 的记录。同样地，�
 这个例子对我们实践的指导意义就是，在删除数据的时候尽量加 limit。
 
 ### 案例八：一个死锁的例子
-![案例7](./pic/案例8.jpg)
+![案例8](./pic/案例8.jpg)
 
 1. session A 启动事务后执行查询语句加 lock in share mode，在索引 c 上加了 next-key lock(5,10] 和间隙锁 (10,15)；
 2. session B 的 update 语句也要在索引 c 上加 next-key lock(5,10] ，进入锁等待；
@@ -616,3 +616,327 @@ session A 在遍历的时候，先访问第一个 c=10 的记录。同样地，�
 session B 的“加next-key lock(5,10]”操作，实际上分成了两步，先是加 (5,10) 的间隙锁，加锁成功；然后加 c=10 的行锁，这时候才被锁住的
 
 我们在分析加锁规则的时候可以用 next-key lock 来分析。但是要知道，具体执行的时候，是要分成间隙锁和行锁两段来执行的
+
+### 案例九：order by语句加锁
+![案例9](./pic/案例9.jpg)
+
+1. 由于是 order by c desc，第一个要定位的是索引 c 上“最右边的”c=20 的行，所以会加上间隙锁 (20,25) 和 next-key lock (15,20]。
+2. 在索引 c 上向左遍历，要扫描到 c=10 才停下来，所以 next-key lock 会加到 (5,10]，这正是阻塞 session B 的 insert 语句的原因。
+3. 在扫描过程中，c=20、c=15、c=10 这三行都存在值，由于是 select *，所以会在主键 id 上加三个行锁。
+
+因此，session A 的 select 语句锁的范围就是：
+1. 索引 c 上 (5, 25)；
+2. 主键索引上 id=10、15、20 三个行锁。
+
+## MySQL有哪些“饮鸩止渴”提高性能的方法？
+### 短连接风暴
+正常的短连接模式就是连接到数据库后，执行很少的 SQL 语句就断开，下次需要的时候再重连。如果使用的是短连接，在业务高峰期的时候，就可能出现连接数突然暴涨的情况
+
+短连接模型存在一个风险，就是一旦数据库处理得慢一些，连接数就会暴涨。max_connections 参数，用来控制一个 MySQL 实例同时存在的连接数的上限，超过这个值，系统就会拒绝接下来的连接请求，并报错提示“Too many connections”。对于被拒绝连接的请求来说，从业务角度看就是数据库不可用
+
+第一种方法：先处理掉那些占着连接但是不工作的线程。从服务端断开连接使用的是 kill connection + id 的命令， 一个客户端处于 sleep 状态时，它的连接被服务端主动断开后，这个客户端并不会马上知道。直到客户端在发起下一个请求的时候，才会收到这样的报错“ERROR 2013 (HY000): Lost connection to MySQL server during query”
+
+第二种方法：减少连接过程的消耗。跳过权限验证的方法是：重启数据库，并使用–skip-grant-tables 参数启动。这样，整个 MySQL 会跳过所有的权限验证阶段，包括连接过程和语句执行过程在内。
+
+### 慢查询性能问题
+引发性能问题的慢查询，大体有以下三种可能：
+1. 索引没有设计好
+
+MySQL 5.6 版本以后，创建索引都支持 Online DDL 了，对于那种高峰期数据库已经被这个语句打挂了的情况，最高效的做法就是直接执行 alter table 语句
+
+2. SQL语句没写好
+
+我们可以通过改写 SQL 语句来处理。MySQL 5.7 提供了 query_rewrite 功能，可以把输入的一种语句改写成另外一种模式
+```sql
+/*比如，语句被错误地写成了 select * from t where id + 1 = 10000，你可以通过下面的方式，增加一个语句改写规则*/
+mysql> insert into query_rewrite.rewrite_rules(pattern, replacement, pattern_database) values ("select * from t where id + 1 = ?", "select * from t where id = ? - 1", "db1");
+call query_rewrite.flush_rewrite_rules();
+```
+
+3. MySQL选错了索引
+
+使用查询重写功能，给原来的语句加上 force index，也可以解决这个问题
+
+### QPS 突增问题
+而下掉一个功能，如果从数据库端处理的话，对应于不同的背景，有不同的方法可用
+1. 一种是由全新业务的 bug 导致的。假设你的 DB 运维是比较规范的，也就是说白名单是一个个加的。这种情况下，如果你能够确定业务方会下掉这个功能，只是时间上没那么快，那么就可以从数据库端直接把白名单去掉。
+2. 如果这个新功能使用的是单独的数据库用户，可以用管理员账号把这个用户删掉，然后断开现有连接。这样，这个新功能的连接不成功，由它引发的 QPS 就会变成 0。
+3. 如果这个新增的功能跟主体功能是部署在一起的，那么我们只能通过处理语句来限制。这时，我们可以使用上面提到的查询重写功能，把压力最大的 SQL 语句直接重写成"select 1"返回。
+
+当然，这个操作的风险很高，需要你特别细致。它可能存在两个副作用：
+1. 如果别的功能里面也用到了这个 SQL 语句模板，会有误伤；
+2. 很多业务并不是靠这一个语句就能完成逻辑的，所以如果单独把这一个语句以 select 1 的结果返回的话，可能会导致后面的业务逻辑一起失败。
+
+## MySQL 是怎么保证数据不丢的？
+### sync_binlog
+1. sync_binlog=0 的时候，表示每次提交事务都只 write，不 fsync；
+2. sync_binlog=1 的时候，表示每次提交事务都会执行 fsync；
+3. sync_binlog=N(N>1) 的时候，表示每次提交事务都 write，但累积 N 个事务后才 fsync。
+
+因此，在出现 IO 瓶颈的场景里，将 sync_binlog 设置成一个比较大的值，可以提升性能。在实际的业务场景中，考虑到丢失日志量的可控性，一般不建议将这个参数设成 0，比较常见的是将其设置为 100~1000 中的某个数值。
+
+但是，将 sync_binlog 设置为 N，对应的风险是：如果主机发生异常重启，会丢失最近 N 个事务的 binlog 日志。
+
+### innodb_flush_log_at_trx_commit
+1. 设置为 0 的时候，表示每次事务提交时都只是把 redo log 留在 redo log buffer 中 ;
+2. 设置为 1 的时候，表示每次事务提交时都将 redo log 直接持久化到磁盘；
+3. 设置为 2 的时候，表示每次事务提交时都只是把 redo log 写到 page cache。
+
+通常我们说 MySQL 的“双 1”配置，指的就是 sync_binlog 和 innodb_flush_log_at_trx_commit 都设置成 1。也就是说，一个事务完整提交前，需要等待两次刷盘，一次是 redo log（prepare 阶段），一次是 binlog。
+
+### binlog_group_commit_sync_delay 和 binlog_group_commit_sync_no_delay_count
+1. binlog_group_commit_sync_delay 参数，表示延迟多少微秒后才调用 fsync;
+2. binlog_group_commit_sync_no_delay_count 参数，表示累积多少次以后才调用 fsync。
+
+这两个条件是或的关系，也就是说只要有一个满足条件就会调用 fsync。
+
+所以，当 binlog_group_commit_sync_delay 设置为 0 的时候，binlog_group_commit_sync_no_delay_count 也无效了。
+
+### 如果你的 MySQL 现在出现了性能瓶颈，而且瓶颈在 IO 上，可以通过哪些方法来提升性能呢？
+1. 设置 binlog_group_commit_sync_delay 和 binlog_group_commit_sync_no_delay_count 参数，减少 binlog 的写盘次数。这个方法是基于“额外的故意等待”来实现的，因此可能会增加语句的响应时间，但没有丢失数据的风险。
+2. 将 sync_binlog 设置为大于 1 的值（比较常见是 100~1000）。这样做的风险是，主机掉电时会丢 binlog 日志。
+3. 将 innodb_flush_log_at_trx_commit 设置为 2。这样做的风险是，主机掉电的时候会丢数据。
+
+### 什么场景下可以设置成非双1配置？
+1. 业务高峰期。一般如果有预知的高峰期，DBA 会有预案，把主库设置成“非双 1”。
+2. 备库延迟，为了让备库尽快赶上主库。
+3. 用备份恢复主库的副本，应用 binlog 的过程，这个跟上一种场景类似。
+4. 批量导入数据的时候。
+
+## MySQL是怎么保证主备一致的？
+```sql
+mysql> CREATE TABLE `t` (
+  `id` int(11) NOT NULL,
+  `a` int(11) DEFAULT NULL,
+  `t_modified` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  KEY `a` (`a`),
+  KEY `t_modified`(`t_modified`)
+) ENGINE=InnoDB;
+ 
+insert into t values(1,1,'2018-11-13');
+insert into t values(2,2,'2018-11-12');
+insert into t values(3,3,'2018-11-11');
+insert into t values(4,4,'2018-11-10');
+insert into t values(5,5,'2018-11-09');
+```
+### MySQL 主备的基本原理
+![主备流程图](./pic/主备流程图.png)
+1. 在备库 B 上通过 change master 命令，设置主库 A 的 IP、端口、用户名、密码，以及要从哪个位置开始请求 binlog，这个位置包含文件名和日志偏移量。
+2. 在备库 B 上执行 start slave 命令，这时候备库会启动两个线程，就是图中的 io_thread 和 sql_thread。其中 io_thread 负责与主库建立连接。
+3. 主库 A 校验完用户名、密码后，开始按照备库 B 传过来的位置，从本地读取 binlog，发给 B。
+4. 备库 B 拿到 binlog 后，写到本地文件，称为中转日志（relay log）。
+5. sql_thread 读取中转日志，解析出日志里的命令，并执行。
+
+### binlog 的三种格式对比
+1. statement 格式下，binlog记录的是执行的sql原文（包括注释）
+- 优点：节省空间（一条sql也就几十个字节的空间）
+- 缺点：部分不安全的sql可能会导致主备不一致，如下所示
+```sql
+/*从库执行时有可能选择和主库不一样的索引而导致删除不一样的数据*/
+mysql> delete from t /*comment*/  where a>=4 and t_modified<='2018-11-10' limit 1;
+```
+2. row格式下，binlog记录了所有操作的数据
+- 优点：信息更全面，不会导致主备不一致
+- 缺点：占用更大的空间，同时写 binlog 也要耗费 IO 资源，影响执行速度（比如你用一个 delete 语句删掉 10 万行数据，用 row 格式的 binlog，就要把这 10 万条记录都写到 binlog 中）
+3. mixed格式下，binlog中同时存在statement和row格式
+- MySQL 自己会判断这条 SQL 语句是否可能引起主备不一致，如果有可能，就用 row 格式，否则就用 statement 格式
+- mixed 格式可以利用 statment 格式的优点，同时又避免了数据不一致的风险
+
+## MySQL是怎么保证高可用的？
+![双M主备切换](./pic/双M主备切换.png)
+### 主备延迟
+与数据同步有关的时间点主要包括以下三个：
+1. 主库 A 执行完成一个事务，写入 binlog，我们把这个时刻记为 T1;
+2. 之后传给备库 B，我们把备库 B 接收完这个 binlog 的时刻记为 T2;
+3. 备库 B 执行完成这个事务，我们把这个时刻记为 T3。 
+   
+所谓主备延迟，就是同一个事务，在备库执行完成的时间和主库执行完成的时间之间的差值，也就是 T3-T1
+
+在备库上执行 show slave status 命令，它的返回结果里面会显示 seconds_behind_master
+
+主备延迟最直接的表现是，备库消费中转日志（relay log）的速度，比主库生产 binlog 的速度要慢
+
+### 主备延迟的来源
+1. 备库所在机器的性能要比主库所在的机器性能差
+2. 备库的压力大，备库上的查询耗费了大量的 CPU 资源，影响了同步速度，造成主备延迟
+3. 大事务，如果一个主库上的语句执行 10 分钟，那这个事务很可能就会导致从库延迟 10 分钟
+4. 大表DDL（也是一种典型的大事务场景）
+
+### 可靠性优先策略
+双 M 结构下，从状态 1 到状态 2 切换的详细过程是这样的：
+1. 判断备库 B 现在的 seconds_behind_master，如果小于某个值（比如 5 秒）继续下一步，否则持续重试这一步；
+2. 把主库 A 改成只读状态，即把 readonly 设置为 true；
+3. 判断备库 B 的 seconds_behind_master 的值，直到这个值变成 0 为止；
+4.把备库 B 改成可读写状态，也就是把 readonly 设置为 false；
+5. 把业务请求切到备库 B。
+
+seconds_behind_master的值会决定系统的不可用时间，需要考虑业务能否接受
+
+### 可用性优先策略
+如果我强行把步骤 4、5 调整到最开始执行，也就是说不等主备数据同步，直接把连接切到备库 B，并且让备库 B 可以读写，那么系统几乎就没有不可用时间了
+
+主备切换的可用性优先策略会导致数据不一致。因此，大多数情况下，我都建议你使用可靠性优先策略。毕竟对数据服务来说的话，数据的可靠性一般还是要优于可用性的
+
+## 主库出问题了，从库怎么办？
+一主多从基本结构：
+
+![一主多从基本结构](./pic/一主多从基本结构.png)
+
+主备切换：
+
+![主备切换](./pic/主备切换.png)
+
+### GTID
+GTID 的全称是 Global Transaction Identifier，也就是全局事务 ID，是一个事务在提交的时候生成的，是这个事务的唯一标识
+```shell
+GTID=server_uuid:gno
+```
+- server_uuid 是一个实例第一次启动时自动生成的，是一个全局唯一的值；
+- gno 是一个整数，初始值是 1，每次提交事务的时候分配给这个事务，并加 1。
+
+GTID 模式的启动：加上参数 gtid_mode=on 和 enforce_gtid_consistency=on
+
+在 GTID 模式下，每个事务都会跟一个 GTID 一一对应。这个 GTID 有两种生成方式，而使用哪种方式取决于 session 变量 gtid_next 的值
+1. 如果 gtid_next=automatic，代表使用默认值。这时，MySQL 就会把 server_uuid:gno 分配给这个事务。
+    - 记录 binlog 的时候，先记录一行 SET @@SESSION.GTID_NEXT=‘server_uuid:gno’;
+    - 把这个 GTID 加入本实例的 GTID 集合。
+
+2. 如果 gtid_next 是一个指定的 GTID 的值，比如通过 set gtid_next='current_gtid’指定为 current_gtid，那么就有两种可能：
+    - 如果 current_gtid 已经存在于实例的 GTID 集合中，接下来执行的这个事务会直接被系统忽略；
+    - 如果 current_gtid 没有存在于实例的 GTID 集合中，就将这个 current_gtid 分配给接下来要执行的事务，也就是说系统不需要给这个事务生成新的 GTID，因此 gno 也不用加 1。
+    
+### 基于 GTID 的主备切换
+在 GTID 模式下，备库 B 要设置为新主库 A’的从库的语法如下：
+```sql
+CHANGE MASTER TO 
+MASTER_HOST=$host_name 
+MASTER_PORT=$port 
+MASTER_USER=$user_name 
+MASTER_PASSWORD=$password 
+master_auto_position=1
+```
+其中，master_auto_position=1 就表示这个主备关系使用的是 GTID 协议
+
+我们把现在这个时刻，实例 A’的 GTID 集合记为 set_a，实例 B 的 GTID 集合记为 set_b。接下来就看看现在的主备切换逻辑
+
+在实例 B 上执行 start slave 命令，取 binlog 的逻辑是这样的：
+1. 实例 B 指定主库 A’，基于主备协议建立连接。
+2. 实例 B 把 set_b 发给主库 A’。
+3. 实例 A’算出 set_a 与 set_b 的差集，也就是所有存在于 set_a，但是不存在于 set_b 的 GTID 的集合，判断 A’本地是否包含了这个差集需要的所有 binlog 事务。
+    - 如果不包含，表示 A’已经把实例 B 需要的 binlog 给删掉了，直接返回错误；
+    - 如果确认全部包含，A’从自己的 binlog 文件里面，找出第一个不在 set_b 的事务，发给 B；
+4. 之后就从这个事务开始，往后读文件，按顺序取 binlog 发给 B 去执行。
+
+### GTID 和在线 DDL
+业务高峰期的慢查询性能问题时，分析到如果是由于索引缺失引起的性能问题，我们可以通过在线加索引来解决。但是，考虑到要避免新增索引对主库性能造成的影响，我们可以先在备库加索引，然后再切换
+
+在双 M 结构下，备库执行的 DDL 语句也会传给主库，为了避免传回后对主库造成影响，可以通过如下操作实现
+
+假设，这两个互为主备关系的库还是实例 X 和实例 Y，且当前主库是 X，并且都打开了 GTID 模式。这时的主备切换流程可以变成下面这样：
+- 在实例 X 上执行 stop slave。
+- 在实例 Y 上执行 DDL 语句。注意，这里并不需要关闭 binlog。
+- 执行完成后，查出这个 DDL 语句对应的 GTID，并记为 server_uuid_of_Y:gno。
+- 到实例 X 上执行以下语句序列：
+```sql
+set GTID_NEXT="server_uuid_of_Y:gno";
+begin;
+commit;
+set gtid_next=automatic;
+start slave;
+```
+这样做的目的在于，既可以让实例 Y 的更新有 binlog 记录，同时也可以确保不会在实例 X 上执行这条更新。
+- 接下来，执行完主备切换，然后照着上述流程再执行一遍即可。
+
+## 读写分离有哪些坑？
+读写分离基本结构：
+
+![读写分离基本结构](./pic/读写分离基本结构.png)
+
+带proxy的读写分离架构：
+
+![带proxy的读写分离架构](./pic/带proxy的读写分离架构.png)
+
+客户端直连和带 proxy 的读写分离架构，各有哪些特点:
+1. 客户端直连方案，因为少了一层 proxy 转发，所以查询性能稍微好一点儿，并且整体架构简单，排查问题更方便。但是这种方案，由于要了解后端部署细节，所以在出现主备切换、库迁移等操作的时候，客户端都会感知到，并且需要调整数据库连接信息。
+2. 带 proxy 的架构，对客户端比较友好。客户端不需要关注后端细节，连接维护、后端信息维护等工作，都是由 proxy 完成的。但这样的话，对后端维护团队的要求会更高。而且，proxy 也需要有高可用架构。因此，带 proxy 架构的整体就相对比较复杂。
+
+由于主从可能存在延迟，客户端执行完一个更新事务后马上发起查询，如果查询选择的是从库的话，就有可能读到刚刚的事务更新之前的状态
+
+这种“在从库上会读到系统的一个过期状态”的现象，称之为**过期读**
+
+### 强制走主库方案
+强制走主库方案其实就是，将查询请求做分类
+1. 对于必须要拿到最新结果的请求，强制将其发到主库上。
+2. 对于可以读到旧数据的请求，才将其发到从库上。
+
+### Sleep 方案
+主库更新后，读从库之前先 sleep 一下
+
+### 判断主备无延迟方案
+要确保备库无延迟，通常有三种做法：
+1. 每次从库执行查询请求前，先判断 seconds_behind_master 是否已经等于 0。如果还不等于 0 ，那就必须等到这个参数变为 0 才能执行查询请求（缺点是不够精确）
+![show_slave_status](./pic/show_slave_status.png)
+2. 对比位点确保主备无延迟：如果 Master_Log_File 和 Relay_Master_Log_File、Read_Master_Log_Pos 和 Exec_Master_Log_Pos 这两组值完全相同，就表示接收到的日志已经同步完成
+   - Master_Log_File 和 Read_Master_Log_Pos，表示的是读到的主库的最新位点；
+   - Relay_Master_Log_File 和 Exec_Master_Log_Pos，表示的是备库执行的最新位点。
+3. 对比 GTID 集合确保主备无延迟：如果这两个集合相同，也表示备库接收到的日志都已经同步完成
+   - Auto_Position=1 ，表示这对主备关系使用了 GTID 协议
+   - Retrieved_Gtid_Set，是备库收到的所有日志的 GTID 集合
+   - Executed_Gtid_Set，是备库所有已经执行完成的 GTID 集合
+   
+这种方案能够保证从库没有延迟，但还是可能存在主库已执行事务，但从库还未收到事务的情况，还是会发生过期读
+
+### 等主库位点方案
+理解等主库位点方案，需要先介绍一条命令：
+```sql
+select master_pos_wait(file, pos[, timeout]);
+```
+1. 它是在从库执行的；
+2. 参数 file 和 pos 指的是主库上的文件名和位置；
+3. timeout 可选，设置为正整数 N 表示这个函数最多等待 N 秒。
+
+这个命令正常返回的结果是一个正整数 M，表示从命令开始执行，到应用完 file 和 pos 表示的 binlog 位置，执行了多少事务
+
+除了正常返回一个正整数 M 外，这条命令还会返回一些其他结果，包括：
+1. 如果执行期间，备库同步线程发生异常，则返回 NULL；
+2. 如果等待超过 N 秒，就返回 -1；
+3. 如果刚开始执行的时候，就发现已经执行过这个位置了，则返回 0。
+
+为了保证能够查到正确的数据，我们可以使用这个逻辑：
+1. trx1 事务更新完成后，马上执行 show master status 得到当前主库执行到的 File 和 Position；
+2. 选定一个从库执行查询语句；
+3. 在从库上执行 select master_pos_wait(File, Position, 1)；
+4. 如果返回值是 >=0 的正整数，则在这个从库执行查询语句；
+5. 否则，到主库执行查询语句。
+
+![master_pos_wait方案](./pic/master_pos_wait方案.png)
+
+### GTID 方案
+如果数据库开启了 GTID 模式，对应的也有等待 GTID 的方案
+```sql
+select wait_for_executed_gtid_set(gtid_set, 1);
+```
+1. 等待，直到这个库执行的事务中包含传入的 gtid_set，返回 0；
+2. 超时返回 1。
+
+MySQL 5.7.6 版本开始，允许在执行完更新类事务后，把这个事务的 GTID 返回给客户端，这样等 GTID 的方案就可以减少一次查询
+
+等GTID的执行流程:
+1. trx1 事务更新完成后，从返回包直接获取这个事务的 GTID，记为 gtid1；
+2. 选定一个从库执行查询语句；
+3. 在从库上执行 select wait_for_executed_gtid_set(gtid1, 1)；
+4. 如果返回值是 0，则在这个从库执行查询语句；
+5. 否则，到主库执行查询语句。
+
+![wait_for_executed_gtid_set方案](./pic/wait_for_executed_gtid_set方案.png)
+
+怎么能够让 MySQL 在执行事务后，返回包中带上 GTID 呢？
+- 你只需要将参数 session_track_gtids 设置为 OWN_GTID，然后通过 API 接口 mysql_session_track_get_first 从返回包解析出 GTID 的值即可
+
+### 结论
+等待位点和等待 GTID 这两个方案，虽然看上去比较靠谱儿，但仍然存在需要权衡的情况。如果所有的从库都延迟，那么请求就会全部落到主库上，这时候会不会由于压力突然增大，把主库打挂
+
+其实，在实际应用中，这几个方案是可以混合使用的。
+
+比如，先在客户端对请求做分类，区分哪些请求可以接受过期读，而哪些请求完全不能接受过期读；然后，对于不能接受过期读的语句，再使用等 GTID 或等位点的方案。
