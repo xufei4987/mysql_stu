@@ -940,3 +940,578 @@ MySQL 5.7.6 版本开始，允许在执行完更新类事务后，把这个事�
 其实，在实际应用中，这几个方案是可以混合使用的。
 
 比如，先在客户端对请求做分类，区分哪些请求可以接受过期读，而哪些请求完全不能接受过期读；然后，对于不能接受过期读的语句，再使用等 GTID 或等位点的方案。
+
+## 误删数据后除了跑路，还能怎么办？
+为了找到解决误删数据的更高效的方法，我们需要先对和 MySQL 相关的误删数据，做下分类：
+1. 使用 delete 语句误删数据行；
+2. 使用 drop table 或者 truncate table 语句误删数据表；
+3. 使用 drop database 语句误删数据库；
+4. 使用 rm 命令误删整个 MySQL 实例。
+
+### 误删行
+如果是使用 delete 语句误删了数据行，可以用 Flashback 工具通过闪回把数据恢复回来
+
+Flashback 恢复数据的原理，是修改 binlog 的内容，拿回原库重放。而能够使用这个方案的前提是，需要确保 binlog_format=row 和 binlog_row_image=FULL
+
+具体恢复数据时，对单个事务做如下处理：
+1. 对于 insert 语句，对应的 binlog event 类型是 Write_rows event，把它改成 Delete_rows event 即可；
+2. 同理，对于 delete 语句，也是将 Delete_rows event 改为 Write_rows event；
+3. 而如果是 Update_rows 的话，binlog 里面记录了数据行修改前和修改后的值，对调这两行的位置即可。
+
+事前预防建议：
+1. 把 sql_safe_updates 参数设置为 on。这样一来，如果我们忘记在 delete 或者 update 语句中写 where 条件，或者 where 条件里面没有包含索引字段的话，这条语句的执行就会报错。
+2. 代码上线前，必须经过 SQL 审计。
+
+### 误删库/表
+使用 truncate /drop table 和 drop database 命令删除的数据，就没办法通过 Flashback 来恢复了。即使我们配置了 binlog_format=row，执行这三个命令时，记录的 binlog 还是 statement 格式。binlog 里面就只有一个 truncate/drop 语句，这些信息是恢复不出数据的
+
+这种情况下，要想恢复数据，就需要使用全量备份，加增量日志的方式了。这个方案要求线上有定期的全量备份，并且实时备份 binlog
+
+恢复数据的流程如下：
+1. 取最近一次全量备份，假设这个库是一天一备，上次备份是当天 0 点；
+2. 用备份恢复出一个临时库；
+3. 从日志备份里面，取出凌晨 0 点之后的日志；
+4. 把这些日志，除了误删除数据的语句外，全部应用到临时库。 
+   
+关于这个过程，需要说明如下几点：
+1. 为了加速数据恢复，如果这个临时库上有多个数据库，你可以在使用 mysqlbinlog 命令时，加上一个–database 参数，用来指定误删表所在的库。这样，就避免了在恢复数据时还要应用其他库日志的情况。
+2. 在应用日志的时候，需要跳过 12 点误操作的那个语句的 binlog：
+   - 如果原实例没有使用 GTID 模式，只能在应用到包含 12 点的 binlog 文件的时候，先用–stop-position 参数执行到误操作之前的日志，然后再用–start-position 从误操作之后的日志继续执行；
+   - 如果实例使用了 GTID 模式，就方便多了。假设误操作命令的 GTID 是 gtid1，那么只需要执行 set gtid_next=gtid1;begin;commit; 先把这个 GTID 加到临时实例的 GTID 集合，之后按顺序执行 binlog 的时候，就会自动跳过误操作的语句。
+   
+### 延迟复制备库
+如果一个库的备份特别大，或者误操作的时间距离上一个全量备份的时间较长，比如一周一备的实例，在备份之后的第 6 天发生误操作，那就需要恢复 6 天的日志，这个恢复时间可能是要按天来计算的。
+
+有什么方法可以缩短恢复数据需要的时间呢？
+
+如果有非常核心的业务，不允许太长的恢复时间，我们可以考虑搭建延迟复制的备库。这个功能是 MySQL 5.6 版本引入的
+
+延迟复制的备库是一种特殊的备库，通过 CHANGE MASTER TO MASTER_DELAY = N 命令，可以指定这个备库持续保持跟主库有 N 秒的延迟。
+
+比如你把 N 设置为 3600，这就代表了如果主库上有数据被误删了，并且在 1 小时内发现了这个误操作命令，这个命令就还没有在这个延迟复制的备库执行。这时候到这个备库上执行 stop slave，再通过之前介绍的方法，跳过误操作命令，就可以恢复出需要的数据。
+
+这样的话，你就随时可以得到一个，只需要最多再追 1 小时，就可以恢复出数据的临时实例，也就缩短了整个数据恢复需要的时间
+
+### 预防误删库/表的方法
+1. 账号分离。这样做的目的是，避免写错命令
+   - 只给业务开发同学 DML 权限，而不给 truncate/drop 权限
+   - 即使是 DBA 团队成员，日常也都规定只使用只读账号，必要的时候才使用有更新权限的账号
+2. 制定操作规范
+   - 在删除数据表之前，必须先对表做改名操作
+   - 改表名的时候，要求给表名加固定的后缀（比如加 _to_be_deleted)，然后删除表的动作必须通过管理系统执行。并且，管理系删除表的时候，只能删除固定后缀的表
+   
+## InnoDB Buffer Pool内存管理
+内存的数据页是在 Buffer Pool (BP) 中管理的，在 WAL 里 Buffer Pool 起到了加速更新的作用。
+
+Buffer Pool 对查询的加速效果，依赖于一个重要的指标，即：内存命中率。
+
+执行 show engine innodb status ，可以看到“Buffer pool hit rate”字样，显示的就是当前的命中率。
+
+InnoDB 内存管理用的是改良后的最近最少使用 (Least Recently Used, LRU) 算法
+
+![改进的LRU算法](./pic/改进的LRU算法.png)
+
+在 InnoDB 实现上，按照 5:3 的比例把整个 LRU 链表分成了 young 区域和 old 区域。图中 LRU_old 指向的就是 old 区域的第一个位置，是整个链表的 5/8 处。
+
+改进后的 LRU 算法执行流程：
+1. 上图中状态 1，要访问数据页 P3，由于 P3 在 young 区域，因此和优化前的 LRU 算法一样，将其移到链表头部，变成状态 2。
+2. 之后要访问一个新的不存在于当前链表的数据页，这时候依然是淘汰掉数据页 Pm，但是新插入的数据页 Px，是放在 LRU_old 处。
+3. 处于 old 区域的数据页，每次被访问的时候都要做下面这个判断：
+   - 若这个数据页在 LRU 链表中存在的时间超过了 1 秒，就把它移动到链表头部；
+   - 如果这个数据页在 LRU 链表中存在的时间短于 1 秒，位置保持不变。1 秒这个时间，是由参数 innodb_old_blocks_time 控制的。其默认值是 1000，单位毫秒。
+
+这个策略，就是为了处理类似全表扫描的操作量身定制的：
+1. 扫描过程中，需要新插入的数据页，都被放到 old 区域 ;
+2. 一个数据页里面有多条记录，这个数据页会被多次访问到，但由于是顺序扫描，这个数据页第一次被访问和最后一次被访问的时间间隔不会超过 1 秒，因此还是会被保留在 old 区域；
+3. 再继续扫描后续的数据，之前的这个数据页之后也不会再被访问到，于是始终没有机会移到链表头部（也就是 young 区域），很快就会被淘汰出去。
+
+可以看到，这个策略最大的收益，就是在扫描这个大表的过程中，虽然也用到了 Buffer Pool，但是对 young 区域完全没有影响，从而保证了 Buffer Pool 响应正常业务的查询命中率
+
+## 到底可不可以使用join？
+```sql
+CREATE TABLE `t2` (
+  `id` int(11) NOT NULL,
+  `a` int(11) DEFAULT NULL,
+  `b` int(11) DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `a` (`a`)
+) ENGINE=InnoDB;
+ 
+drop procedure idata;
+delimiter ;;
+create procedure idata()
+begin
+  declare i int;
+  set i=1;
+  while(i<=1000)do
+    insert into t2 values(i, i, i);
+    set i=i+1;
+  end while;
+end;;
+delimiter ;
+call idata();
+ 
+create table t1 like t2;
+insert into t1 (select * from t2 where id<=100)
+```
+### Index Nested-Loop Join
+```sql
+select * from t1 straight_join t2 on (t1.a=t2.a);
+```
+这个语句的执行流程:
+1. 从表 t1 中读入一行数据 R；
+2. 从数据行 R 中，取出 a 字段到表 t2 里去查找；
+3. 取出表 t2 中满足条件的行，跟 R 组成一行，作为结果集的一部分；
+4. 重复执行步骤 1 到 3，直到表 t1 的末尾循环结束。
+
+![Index Nested-Loop Join](./pic/Index Nested-Loop Join.png)
+
+1. 对驱动表 t1 做了全表扫描，这个过程需要扫描 100 行；
+2. 而对于每一行 R，根据 a 字段去表 t2 查找，走的是树搜索过程。由于我们构造的数据都是一一对应的，因此每次的搜索过程都只扫描一行，也是总共扫描 100 行；
+3. 所以，整个执行流程，总扫描行数是 200。
+
+**如何选择驱动表：**
+- 假设被驱动表的行数是 M。每次在被驱动表查一行数据，要先搜索索引 a，再搜索主键索引。每次搜索一棵树近似复杂度是以 2 为底的 M 的对数，记为 log2M，所以在被驱动表上查一行的时间复杂度是 2*log2M。
+- 假设驱动表的行数是 N，执行过程就要扫描驱动表 N 行，然后对于每一行，到被驱动表上匹配一次。
+- 因此整个执行过程，近似复杂度是 N + N*2*log2M。
+- 显然，N 对扫描行数的影响更大，因此应该让小表来做驱动表。
+
+### Block Nested-Loop Join
+join_buffer 的大小是由参数 join_buffer_size 设定的，默认值是 256k。如果放不下表 t1 的所有数据话，策略很简单，就是分段放。假设join_buffer_size只能存放88条数据，再执行一下语句：
+```sql
+select * from t1 straight_join t2 on (t1.a=t2.b);
+```
+执行过程就变成了：
+1. 扫描表 t1，顺序读取数据行放入 join_buffer 中，放完第 88 行 join_buffer 满了，继续第 2 步；
+2. 扫描表 t2，把 t2 中的每一行取出来，跟 join_buffer 中的数据做对比，满足 join 条件的，作为结果集的一部分返回；
+3. 清空 join_buffer；
+4. 继续扫描表 t1，顺序读取最后的 12 行数据放入 join_buffer 中，继续执行第 2 步。
+
+![Block Nested-Loop Join](./pic/Block Nested-Loop Join.png)
+
+**如何选择驱动表：**
+- 假设，驱动表的数据行数是 N，需要分 K 段才能完成算法流程，被驱动表的数据行数是 M。
+- 注意，这里的 K 不是常数，N 越大 K 就会越大，因此把 K 表示为λ*N，显然λ的取值范围是 (0,1)。
+- 扫描行数是 N+λ*N*M，内存判断 N*M 次。
+- 显然，内存判断次数是不受选择哪个表作为驱动表影响的。而考虑到扫描行数，在 M 和 N 大小确定的情况下，N 小一些，整个算式的结果会更小，应该让小表当驱动表
+
+### 总结
+能不能使用 join 语句？
+1. 如果可以使用 Index Nested-Loop Join 算法，也就是说可以用上被驱动表上的索引，其实是没问题的；
+2. 如果使用 Block Nested-Loop Join 算法，扫描行数就会过多。尤其是在大表上的 join 操作，这样可能要扫描被驱动表很多次，会占用大量的系统资源。所以这种 join 尽量不要用。
+3. 判断要不要使用 join 语句时，就是看 explain 结果里面，Extra 字段里面有没有出现“Block Nested Loop”字样
+
+如果要使用 join，应该选择大表做驱动表还是选择小表做驱动表？
+1. 如果是 Index Nested-Loop Join 算法，应该选择小表做驱动表；
+2. 如果是 Block Nested-Loop Join 算法：
+   - 在 join_buffer_size 足够大的时候，是一样的；
+   - 在 join_buffer_size 不够大的时候（这种情况更常见），应该选择小表做驱动表。
+3. 所以，这个问题的结论就是，总是应该使用小表做驱动表
+
+**注意**：在决定哪个表做驱动表的时候，应该是两个表按照各自的条件过滤，过滤完成之后，计算参与 join 的各个字段的总数据量，数据量小的那个表，就是“小表”，应该作为驱动表
+
+## join语句怎么优化？
+```sql
+create table t1(id int primary key, a int, b int, index(a));
+create table t2 like t1;
+drop procedure idata;
+delimiter ;;
+create procedure idata()
+begin
+  declare i int;
+  set i=1;
+  while(i<=1000)do
+    insert into t1 values(i, 1001-i, i);
+    set i=i+1;
+  end while;
+  
+  set i=1;
+  while(i<=1000000)do
+    insert into t2 values(i, i, i);
+    set i=i+1;
+  end while;
+ 
+end;;
+delimiter ;
+call idata();
+```
+在表 t1 里，插入了 1000 行数据，每一行的 a=1001-id 的值。也就是说，表 t1 中字段 a 是逆序的。同时，在表 t2 中插入了 100 万行数据
+
+### Multi-Range Read优化
+Multi-Range Read 优化 (MRR)：主要目的是尽量使用顺序读盘
+```sql
+select * from t1 where a>=1 and a<=100;
+```
+主键索引是一棵B+树，在这棵树上，每次只能根据一个主键id查到一行数据。因此，回表肯定是一行行搜索主键索引的，基本流程如下图所示
+
+![基本回表流程](./pic/基本回表流程.png)
+
+MRR 优化的设计思路：因为大多数的数据都是按照主键递增顺序插入得到的，所以我们可以认为，如果按照主键的递增顺序查询的话，对磁盘的读比较接近顺序读，能够提升读性能
+
+![MRR执行流程](./pic/MRR执行流程.png)
+
+1. 根据索引 a，定位到满足条件的记录，将 id 值放入 read_rnd_buffer 中 ;
+2. 将 read_rnd_buffer 中的 id 进行递增排序；
+3. 排序后的 id 数组，依次到主键 id 索引中查记录，并作为结果返回。
+
+read_rnd_buffer 的大小是由 read_rnd_buffer_size 参数控制
+
+想要稳定地使用 MRR 优化的话，需要设置set optimizer_switch="mrr_cost_based=off"。（官方文档的说法，是现在的优化器策略，判断消耗的时候，会更倾向于不使用 MRR，把 mrr_cost_based 设置为 off，就是固定使用 MRR 了。）
+
+### Batched Key Access
+MySQL 在 5.6 版本后开始引入的 Batched Key Access(BKA) 算法，这个 BKA 算法，其实就是对 NLJ 算法的优化。
+
+![Batched Key Access流程](./pic/Batched Key Access流程.png)
+
+NLJ 算法执行的逻辑是：从驱动表 t1，一行行地取出 a 的值，再到被驱动表 t2 去做 join。也就是说，对于表 t2 来说，每次都是匹配一个值。这时，MRR 的优势就用不上了
+
+怎么才能一次性地多传些值给表 t2 呢？方法就是，从表 t1 里一次性地多拿些行出来，一起传给表 t2
+
+既然如此，就把表 t1 的数据取出来一部分，先放到一个临时内存。这个临时内存就是 join_buffer
+
+要使用 BKA 优化算法的话，你需要在执行 SQL 语句之前，先设置
+```sql
+/*BKA 算法的优化要依赖于 MRR*/
+set optimizer_switch='mrr=on,mrr_cost_based=off,batched_key_access=on';
+```
+
+### BNL算法的性能问题
+使用 Block Nested-Loop Join(BNL) 算法时，可能会对被驱动表做多次扫描。如果这个被驱动表是一个大的冷数据表，除了会导致 IO 压力大以外，还会对系统有什么影响呢？
+- 由于 InnoDB 对 Bufffer Pool 的 LRU 算法做了优化，即：第一次从磁盘读入内存的数据页，会先放在 old 区域。如果 1 秒之后这个数据页不再被访问了，就不会被移动到 LRU 链表头部，这样对 Buffer Pool 的命中率影响就不大
+- 但是，如果一个使用 BNL 算法的 join 语句，多次扫描一个冷表，而且这个语句执行时间超过 1 秒，就会在再次扫描冷表的时候，把冷表的数据页移到 LRU 链表头部
+- 如果这个冷表很大，业务正常访问的数据页，没有机会进入 young 区域
+- 由于优化机制的存在，一个正常访问的数据页，要进入 young 区域，需要隔 1 秒后再次被访问到。但是，由于我们的 join 语句在循环读磁盘和淘汰内存页，进入 old 区域的数据页，很可能在 1 秒之内就被淘汰了。这样，就会导致这个 MySQL 实例的 Buffer Pool 在这段时间内，young 区域的数据页没有被合理地淘汰
+- 大表 join 操作虽然对 IO 有影响，但是在语句执行结束后，对 IO 的影响也就结束了。但是，对 Buffer Pool 的影响就是持续性的，需要依靠后续的查询请求慢慢恢复内存命中率
+
+BNL 算法对系统的影响主要包括三个方面：
+1. 可能会多次扫描被驱动表，占用磁盘 IO 资源
+2. 判断 join 条件需要执行 M*N 次对比（M、N 分别是两张表的行数），如果是大表就会占用非常多的 CPU 资源
+3. 可能会导致 Buffer Pool 的热数据被淘汰，影响内存命中率
+
+场景的优化手段：
+1. 考虑增大 join_buffer_size 的值，减少对被驱动表的扫描次数
+2. 给被驱动表的 join 字段加上索引，把 BNL 算法转成 BKA 算法
+
+### BNL转BKA
+一些情况下，可以直接在被驱动表上建索引，就可以直接转成 BKA 算法了
+
+但是，有时候确实会碰到一些不适合在被驱动表上建索引的情况。比如下面这个语句：
+```sql
+select * from t1 join t2 on (t1.b=t2.b) where t2.b>=1 and t2.b<=2000;
+```
+如果这条语句同时是一个低频的 SQL 语句，那么再为这个语句在表 t2 的字段 b 上创建一个索引就很浪费了
+
+使用BNL算法来join的执行流程：
+1. 把表 t1 的所有字段取出来，存入 join_buffer 中。这个表只有 1000 行，join_buffer_size 默认值是 256k，可以完全存入
+2. 扫描表 t2，取出每一行数据跟 join_buffer 中的数据进行对比
+   - 如果不满足 t1.b=t2.b，则跳过；
+   - 如果满足 t1.b=t2.b, 再判断其他条件，也就是是否满足 t2.b 处于 [1,2000] 的条件，如果是，就作为结果集的一部分返回，否则跳过。
+
+对于表 t2 的每一行，判断 join 是否满足的时候，都需要遍历 join_buffer 中的所有行。因此判断等值条件的次数是 1000*100 万 =10 亿次，这个判断的工作量很大
+
+可以考虑使用临时表进行优化：
+1. 把表 t2 中满足条件的数据放在临时表 tmp_t 中；
+2. 为了让 join 使用 BKA 算法，给临时表 tmp_t 的字段 b 加上索引；
+3. 让表 t1 和 tmp_t 做 join 操作。
+```sql
+create temporary table temp_t(id int primary key, a int, b int, index(b))engine=innodb;
+insert into temp_t select * from t2 where b>=1 and b<=2000;
+select * from t1 join temp_t on (t1.b=temp_t.b);
+```
+
+### 总结
+总体来看，不论是在原表上加索引，还是用有索引的临时表，我们的思路都是让 join 语句能够用上被驱动表上的索引，来触发 BKA 算法，提升查询性能
+
+## 临时表
+临时表和内存表的区别：
+- 内存表，指的是使用 Memory 引擎的表，建表语法是 create table … engine=memory。这种表的数据都保存在内存里，系统重启的时候会被清空，但是表结构还在。除了这两个特性看上去比较“奇怪”外，从其他的特征上看，它就是一个正常的表。
+- 临时表，可以使用各种引擎类型 。如果是使用 InnoDB 引擎或者 MyISAM 引擎的临时表，写数据的时候是写到磁盘上的。当然，临时表也可以使用 Memory 引擎。
+
+### 临时表的特性
+![临时表特性示例](./pic/临时表特性示例.png)
+
+1. 建表语法是 create temporary table …。
+2. 一个临时表只能被创建它的 session 访问，对其他线程不可见。所以，图中 session A 创建的临时表 t，对于 session B 就是不可见的。
+3. 临时表可以与普通表同名。
+4. session A 内有同名的临时表和普通表的时候，show create 语句，以及增删改查语句访问的是临时表。
+5. show tables 命令不显示临时表。
+
+### 临时表的应用
+将一个大表 ht，按照字段 f，拆分成 1024 个分表，然后分布到 32 个数据库实例上。如下图所示
+
+![分库分表简图](./pic/分库分表简图.png)
+
+在这个架构中，分区 key 的选择是以“减少跨库和跨表查询”为依据的。如果大部分的语句都会包含 f 的等值条件，那么就要用 f 做分区键。这样，在 proxy 这一层解析完 SQL 语句以后，就能确定将这条语句路由到哪个分表做查询
+```sql
+select v from ht where f=N;
+```
+但是，如果这个表上还有另外一个索引 k，并且查询语句是这样的：
+```sql
+select v from ht where k >= M order by t_modified desc limit 100;
+```
+这时候，由于查询条件里面没有用到分区字段 f，只能到所有的分区中去查找满足条件的所有行，然后统一做 order by 的操作
+
+1. 在 proxy 层的进程代码中实现排序
+   - 需要的开发工作量比较大。我们举例的这条语句还算是比较简单的，如果涉及到复杂的操作，比如 group by，甚至 join 这样的操作，对中间层的开发能力要求比较高；
+   - 对 proxy 端的压力比较大，尤其是很容易出现内存不够用和 CPU 瓶颈的问题。
+2. 把各个分库拿到的数据，汇总到一个 MySQL 实例的一个表中，然后在这个汇总实例上做逻辑操作
+   - 在汇总库上创建一个临时表 temp_ht，表里包含三个字段 v、k、t_modified；
+   - 在各个分库上执行 select v,k,t_modified from ht_x where k >= M order by t_modified desc limit 100;
+   - 把分库执行的结果插入到 temp_ht 表中
+   - 执行select v from temp_ht order by t_modified desc limit 100;
+   
+## 什么时候会使用内部临时表？
+### union 执行流程
+```sql
+create table t1(id int primary key, a int, b int, index(a));
+delimiter ;;
+create procedure idata()
+begin
+  declare i int;
+ 
+  set i=1;
+  while(i<=1000)do
+    insert into t1 values(i, i, i);
+    set i=i+1;
+  end while;
+end;;
+delimiter ;
+call idata();
+```
+执行以下语句
+```sql
+(select 1000 as f) union (select id from t1 order by id desc limit 2);
+```
+这个语句的执行流程是这样的：
+1. 创建一个内存临时表，这个临时表只有一个整型字段 f，并且 f 是主键字段。
+2. 执行第一个子查询，得到 1000 这个值，并存入临时表中。
+3. 执行第二个子查询：
+   - 拿到第一行 id=1000，试图插入临时表中。但由于 1000 这个值已经存在于临时表了，违反了唯一性约束，所以插入失败，然后继续执行；
+   - 取到第二行 id=999，插入临时表成功。
+4. 从临时表中按行取出数据，返回结果，并删除临时表，结果中包含两行数据分别是 1000 和 999。
+
+可以看到，这里的内存临时表起到了暂存数据的作用，而且计算过程还用上了临时表主键 id 的唯一性约束，实现了 union 的语义
+
+如果把上面这个语句中的 union 改成 union all 的话，就没有了“去重”的语义。这样执行的时候，就依次执行子查询，得到的结果直接作为结果集的一部分，发给客户端。因此也就不需要临时表了
+
+### group by 执行流程
+```sql
+select id%10 as m, count(*) as c from t1 group by m;
+```
+执行流程是这样的：
+1. 创建内存临时表，表里有两个字段 m 和 c，主键是 m；
+2. 扫描表 t1 的索引 a，依次取出叶子节点上的 id 值，计算 id%10 的结果，记为 x；
+   - 如果临时表中没有主键为 x 的行，就插入一个记录 (x,1);
+   - 如果表中有主键为 x 的行，就将 x 这一行的 c 值加 1；
+3. 遍历完成后，再根据字段 m 做排序，得到结果集返回给客户端。
+
+如果你的需求并不需要对结果进行排序，那你可以在 SQL 语句末尾增加 order by null，也就是改成：
+```sql
+select id%10 as m, count(*) as c from t1 group by m order by null;
+```
+
+### group by 优化方法 -- 索引
+不论是使用内存临时表还是磁盘临时表，group by 逻辑都需要构造一个带唯一索引的表，执行代价都是比较高的
+
+执行 group by 语句为什么需要临时表？
+
+group by 的语义逻辑，是统计不同的值出现的个数。但是，由于每一行的 id%100 的结果是无序的，所以我们就需要有一个临时表，来记录并统计结果。
+
+![groupby算法优化-有序输入](./pic/groupby算法优化-有序输入.png)
+
+如果可以确保输入的数据是有序的，那么计算 group by 的时候，就只需要从左到右，顺序扫描，依次累加。也就是下面这个过程：
+- 当碰到第一个 1 的时候，已经知道累积了 X 个 0，结果集里的第一行就是 (0,X);
+- 当碰到第一个 2 的时候，已经知道累积了 Y 个 1，结果集里的第二行就是 (1,Y);
+按照这个逻辑执行的话，扫描到整个输入的数据结束，就可以拿到 group by 的结果，不需要临时表，也不需要再额外排序
+
+可以用下面的方法创建一个列 z，然后在 z 列上创建一个索引
+```sql
+alter table t1 add column z int generated always as(id % 100), add index(z);
+```
+
+这样，索引 z 上的数据就是有序的了（这个语句的执行不再需要临时表，也不需要排序）
+```sql
+select z, count(*) as c from t1 group by z;
+```
+
+### group by 优化方法 -- 直接排序
+如果碰上不适合创建索引的场景，我们还是要老老实实做排序的
+
+如果我们明明知道，一个 group by 语句中需要放到临时表上的数据量特别大，却还是要按照“先放到内存临时表，插入一部分数据后，发现内存临时表不够用了再转成磁盘临时表”，看上去就有点儿傻
+
+在 group by 语句中加入 SQL_BIG_RESULT 这个提示（hint），就可以告诉优化器：这个语句涉及的数据量很大，请直接用磁盘临时表
+```sql
+select SQL_BIG_RESULT id%100 as m, count(*) as c from t1 group by m;
+```
+执行流程就是这样的：
+1. 初始化 sort_buffer，确定放入一个整型字段，记为 m；
+2 .扫描表 t1 的索引 a，依次取出里面的 id 值, 将 id%100 的值存入 sort_buffer 中；
+3. 扫描完成后，对 sort_buffer 的字段 m 做排序（如果 sort_buffer 内存不够用，就会利用磁盘临时文件辅助排序）；
+4. 排序完成后，就得到了一个有序数组。
+5. 根据有序数组，得到数组里面的不同值，以及每个值的出现次数
+
+**MySQL 什么时候会使用内部临时表？**
+1. 如果语句执行过程可以一边读数据，一边直接得到结果，是不需要额外内存的，否则就需要额外的内存，来保存中间结果；
+2. join_buffer 是无序数组，sort_buffer 是有序数组，临时表是二维表结构；
+3. 如果执行逻辑需要用到二维表特性，就会优先考虑使用临时表。比如我们的例子中，union 需要用到唯一索引约束， group by 还需要用到另外一个字段来存累积计数。
+
+## 自增主键ID
+自增主键ID能够保证自增，但不能保证连续，有以下3种情况导致不连续：
+1. 唯一键冲突是导致自增主键 id 不连续
+```sql
+CREATE TABLE `t2` (
+ `id` int(11) NOT NULL AUTO_INCREMENT,
+ `c` int(11) DEFAULT NULL,
+ `d` int(11) DEFAULT NULL,
+ PRIMARY KEY (`id`),
+ UNIQUE KEY `c` (`c`)
+) ENGINE=InnoDB;
+insert into t2 values(null, 1, 1);
+insert into t2 values(null, 1, 1);
+insert into t2 values(null, 2, 2);
+// 插入的行是 (1,1,1)和(3,2,2)
+```
+2. 事务回滚也会产生自增主键 id 不连续
+```sql
+insert into t values(null,1,1);
+begin;
+insert into t values(null,2,2);
+rollback;
+insert into t values(null,2,2);
+// 插入的行是 (1,1,1)和(3,2,2)
+```
+3. 批量插入数据(语句类型是 insert … select、replace … select 和 load data 语句)产生自增主键 id 不连续
+```sql
+insert into t values(null, 1,1);
+insert into t values(null, 2,2);
+insert into t values(null, 3,3);
+insert into t values(null, 4,4);
+create table t2 like t;
+insert into t2(c,d) select c,d from t;
+insert into t2 values(null, 5,5);
+//实际上插入的数据就是(8,5,5)
+```
+
+## 怎么最快地复制一张表？
+```sql
+create database db1;
+use db1;
+ 
+create table t(id int primary key, a int, b int, index(a))engine=innodb;
+delimiter ;;
+  create procedure idata()
+  begin
+    declare i int;
+    set i=1;
+    while(i<=1000)do
+      insert into t values(i,i,i);
+      set i=i+1;
+    end while;
+  end;;
+delimiter ;
+call idata();
+ 
+create database db2;
+create table db2.t like db1.t
+```
+假设，我们要把 db1.t 里面 a>900 的数据行导出来，插入到 db2.t 中。
+### mysqldump 方法
+```sql
+mysqldump -h$host -P$port -u$user --add-locks=0 --no-create-info --single-transaction  --set-gtid-purged=OFF db1 t --where="a>900" --result-file=/client_tmp/t.sql
+```
+主要参数含义如下：
+1. –single-transaction 的作用是，在导出数据的时候不需要对表 db1.t 加表锁，而是使用 START TRANSACTION WITH CONSISTENT SNAPSHOT 的方法；
+2. –add-locks 设置为 0，表示在输出的文件结果里，不增加" LOCK TABLES t WRITE;" ；
+3. –no-create-info 的意思是，不需要导出表结构；
+4. –set-gtid-purged=off 表示的是，不输出跟 GTID 相关的信息；
+5. -result-file 指定了输出文件的路径，其中 client 表示生成的文件是在客户端机器上的。
+
+通过这条 mysqldump 命令生成的 t.sql 文件中就包含如下所示的 INSERT 语句：
+```sql
+INSERT INTO `t` VALUES (901,901,901),(902,902,902),(903,903,903),...
+```
+
+通过下面这条命令，将这些 INSERT 语句放到 db2 库里去执行:
+```sql
+mysql -h$host -P$port  -u$user db2 -e "source /client_tmp/t.sql"
+```
+
+### 导出 CSV 文件
+另一种方法是直接将结果导出成.csv 文件。MySQL 提供了下面的语法，用来将查询结果导出到服务端本地目录：
+```sql
+select * from db1.t where a>900 into outfile '/server_tmp/t.csv';
+```
+1. 这条语句会将结果保存在服务端
+2. into outfile 指定了文件的生成位置（/server_tmp/），这个位置必须受参数 secure_file_priv 的限制
+   - 如果设置为 empty，表示不限制文件生成的位置，这是不安全的设置；
+   - 如果设置为一个表示路径的字符串，就要求生成的文件只能放在这个指定的目录，或者它的子目录；
+   - 如果设置为 NULL，就表示禁止在这个 MySQL 实例上执行 select … into outfile 操作。
+3. 这条命令不会帮你覆盖文件，因此你需要确保 /server_tmp/t.csv 这个文件不存在
+
+得到.csv 导出文件后，你就可以用下面的 load data 命令将数据导入到目标表 db2.t 中:
+```sql
+load data infile '/server_tmp/t.csv' into table db2.t;
+```
+
+load data 命令有两种用法：
+1. 不加“local”，是读取服务端的文件，这个文件必须在 secure_file_priv 指定的目录或子目录下；
+2. 加上“local”，读取的是客户端的文件，只要 mysql 客户端有访问这个文件的权限即可。这时候，MySQL 客户端会先把本地文件传给服务端，然后执行上述的 load data 流程。
+
+select …into outfile 方法不会生成表结构文件。mysqldump 提供了一个–tab 参数，可以同时导出表结构定义文件和 csv 数据文件
+```sql
+mysqldump -h$host -P$port -u$user ---single-transaction  --set-gtid-purged=OFF db1 t --where="a>900" --tab=$secure_file_priv
+```
+
+### 物理拷贝方法
+直接把 db1.t 表的.frm 文件和.ibd 文件拷贝到 db2 目录下，是否可行呢？
+- 答案是不行的。因为，一个 InnoDB 表，除了包含这两个物理文件外，还需要在数据字典中注册。直接拷贝这两个文件的话，因为数据字典中没有 db2.t 这个表，系统是不会识别和接受它们的
+
+在 MySQL 5.6 版本引入了可传输表空间(transportable tablespace) 的方法，可以通过导出 + 导入表空间的方式，实现物理拷贝表的功能
+
+假设我们现在的目标是在 db1 库下，复制一个跟表 t 相同的表 r，具体的执行步骤如下：
+1. 执行 create table r like t，创建一个相同表结构的空表；
+2. 执行 alter table r discard tablespace，这时候 r.ibd 文件会被删除；
+3. 执行 flush table t for export，这时候 db1 目录下会生成一个 t.cfg 文件；
+4. 在 db1 目录下执行 cp t.cfg r.cfg; cp t.ibd r.ibd；这两个命令（这里需要注意的是，拷贝得到的两个文件，MySQL 进程要有读写权限）；
+5. 执行 unlock tables，这时候 t.cfg 文件会被删除；
+6. 执行 alter table r import tablespace，将这个 r.ibd 文件作为表 r 的新的表空间，由于这个文件的数据内容和 t.ibd 是相同的，所以表 r 中就有了和表 t 相同的数据。
+
+![物流拷贝表](./pic/物流拷贝表.png)
+
+### 总结
+1. 物理拷贝的方式速度最快，尤其对于大表拷贝来说是最快的方法。如果出现误删表的情况，用备份恢复出误删之前的临时库，然后再把临时库中的表拷贝到生产库上，是恢复数据最快的方法。但是，这种方法的使用也有一定的局限性：
+   - 必须是全表拷贝，不能只拷贝部分数据；
+   - 需要到服务器上拷贝数据，在用户无法登录数据库主机的场景下无法使用；
+   - 由于是通过拷贝物理文件实现的，源表和目标表都是使用 InnoDB 引擎时才能使用。
+2. 用 mysqldump 生成包含 INSERT 语句文件的方法，可以在 where 参数增加过滤条件，来实现只导出部分数据。这个方式的不足之一是，不能使用 join 这种比较复杂的 where 条件写法。
+3. 用 select … into outfile 的方法是最灵活的，支持所有的 SQL 写法。但，这个方法的缺点之一就是，每次只能导出一张表的数据，而且表结构也需要另外的语句单独备份。
+
+## 要不要使用分区表？
+### 分区表是什么？
+```sql
+CREATE TABLE `t` (
+  `ftime` datetime NOT NULL,
+  `c` int(11) DEFAULT NULL,
+  KEY (`ftime`)
+) ENGINE=InnoDB DEFAULT CHARSET=latin1
+PARTITION BY RANGE (YEAR(ftime))
+(PARTITION p_2017 VALUES LESS THAN (2017) ENGINE = InnoDB,
+ PARTITION p_2018 VALUES LESS THAN (2018) ENGINE = InnoDB,
+ PARTITION p_2019 VALUES LESS THAN (2019) ENGINE = InnoDB,
+PARTITION p_others VALUES LESS THAN MAXVALUE ENGINE = InnoDB);
+insert into t values('2017-4-1',1),('2018-4-1',1);
+```
+按照定义的分区规则，这两行记录分别落在 p_2018 和 p_2019 这两个分区上
+
+这个表包含了一个.frm 文件和 4 个.ibd 文件，每个分区对应一个.ibd 文件。也就是说：
+- 对于引擎层来说，这是 4 个表；
+- 对于 Server 层来说，这是 1 个表。
+
+### 分区表的 server 层行为
+1. MySQL 在第一次打开分区表的时候，需要访问所有的分区；
+2. 在 server 层，认为这是同一张表，因此所有分区共用同一个 MDL 锁；
+3. 在引擎层，认为这是不同的表，因此 MDL 锁之后的执行过程，会根据分区表规则，只访问必要的分区。
+
+### 分区表的应用场景
+1. 对业务透明，相对于用户分表来说，使用分区表的业务代码更简洁
+2. 分区表可以很方便的清理历史数据，直接通过 alter table t drop partition …这个语法删掉分区，从而删掉过期的历史数据
